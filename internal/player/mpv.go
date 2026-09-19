@@ -54,6 +54,12 @@ func (r *ring) String() string {
 	return r.buf.String()
 }
 
+// ipcReply is one mpv response to a request_id command.
+type ipcReply struct {
+	data json.RawMessage
+	err  string
+}
+
 // Player controls one idle mpv process.
 type Player struct {
 	mu       sync.Mutex
@@ -63,6 +69,7 @@ type Player struct {
 	endpoint string
 	waitCh   chan error
 	nextReq  int
+	pending  map[int]chan ipcReply
 	// OnEnd is called when mpv reports end-file (track finished).
 	OnEnd func()
 }
@@ -114,6 +121,7 @@ func start(mpvPath string) (*Player, error) {
 			p := &Player{
 				cmd: cmd, conn: conn, endpoint: endpoint,
 				waitCh: waitCh, nextReq: 1,
+				pending: make(map[int]chan ipcReply),
 			}
 			p.writer = bufio.NewWriter(conn)
 			if err := p.observe("end-file"); err != nil {
@@ -138,27 +146,103 @@ func start(mpvPath string) (*Player, error) {
 	}
 }
 
-// send writes one IPC command. Replies are not read: eventLoop owns conn
-// reads (end-file events), so write errors are the failure signal.
+// send writes one fire-and-forget IPC command. Any reply mpv sends back
+// carries the request_id but has no waiter, so eventLoop drops it; write
+// errors are the failure signal.
 func (p *Player) send(cmd any) error {
+	return p.writeCmd(cmd, nil)
+}
+
+// writeCmd writes one IPC command stamped with a fresh request_id. When
+// waiter is non-nil it is registered first so the reply is routed back.
+func (p *Player) writeCmd(cmd any, waiter chan ipcReply) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	id := p.nextReq
 	p.nextReq++
+	if waiter != nil {
+		if p.pending == nil {
+			p.pending = make(map[int]chan ipcReply)
+		}
+		p.pending[id] = waiter
+	}
 	raw, err := json.Marshal(cmd)
 	if err != nil {
+		if waiter != nil {
+			delete(p.pending, id)
+		}
+		p.mu.Unlock()
 		return err
 	}
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
+		if waiter != nil {
+			delete(p.pending, id)
+		}
+		p.mu.Unlock()
 		return err
 	}
 	m["request_id"] = id
 	raw, _ = json.Marshal(m)
 	if _, err := p.writer.Write(append(raw, '\n')); err != nil {
+		if waiter != nil {
+			delete(p.pending, id)
+		}
+		p.mu.Unlock()
 		return err
 	}
-	return p.writer.Flush()
+	err = p.writer.Flush()
+	p.mu.Unlock()
+	return err
+}
+
+// query sends one IPC command and waits for its reply.
+func (p *Player) query(cmd any, timeout time.Duration) (json.RawMessage, error) {
+	waiter := make(chan ipcReply, 1)
+	if err := p.writeCmd(cmd, waiter); err != nil {
+		return nil, err
+	}
+	select {
+	case r := <-waiter:
+		if r.err != "" && r.err != "success" {
+			return nil, fmt.Errorf("player: mpv error: %s", r.err)
+		}
+		return r.data, nil
+	case <-time.After(timeout):
+		p.mu.Lock()
+		for id, ch := range p.pending {
+			if ch == waiter {
+				delete(p.pending, id)
+				break
+			}
+		}
+		p.mu.Unlock()
+		return nil, errors.New("player: mpv query timed out")
+	}
+}
+
+// getProperty reads one mpv property (e.g. time-pos, duration).
+func (p *Player) getProperty(prop string) (json.RawMessage, error) {
+	return p.query(command("get_property", prop), 2*time.Second)
+}
+
+// Position returns playback position and duration in seconds. It errors
+// when mpv is idle or a property is unavailable.
+func (p *Player) Position() (pos, dur float64, err error) {
+	posRaw, err := p.getProperty("time-pos")
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := json.Unmarshal(posRaw, &pos); err != nil {
+		return 0, 0, fmt.Errorf("player: decode time-pos: %w", err)
+	}
+	durRaw, err := p.getProperty("duration")
+	if err != nil {
+		return pos, 0, nil // position known, duration unknown
+	}
+	if err := json.Unmarshal(durRaw, &dur); err != nil {
+		return pos, 0, nil
+	}
+	return pos, dur, nil
 }
 
 // command builds a raw mpv command array.
@@ -198,21 +282,46 @@ func (p *Player) SetVolume(v int) error {
 	return p.send(command("set_property", "volume", v))
 }
 
-// eventLoop watches for end-file events to trigger auto-advance.
+// eventLoop demuxes incoming frames: replies carrying request_id go to
+// their query waiter, event frames drive end-file auto-advance.
 func (p *Player) eventLoop() {
+	defer p.failPending()
 	sc := bufio.NewScanner(p.conn)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
 		var msg struct {
-			Event  string `json:"event"`
-			Reason string `json:"reason"`
+			RequestID *int            `json:"request_id"`
+			Error     string          `json:"error"`
+			Data      json.RawMessage `json:"data"`
+			Event     string          `json:"event"`
+			Reason    string          `json:"reason"`
 		}
 		if err := json.Unmarshal(sc.Bytes(), &msg); err != nil {
+			continue
+		}
+		if msg.RequestID != nil {
+			p.mu.Lock()
+			ch := p.pending[*msg.RequestID]
+			delete(p.pending, *msg.RequestID)
+			p.mu.Unlock()
+			if ch != nil {
+				ch <- ipcReply{data: msg.Data, err: msg.Error}
+			}
 			continue
 		}
 		if msg.Event == "end-file" && msg.Reason == "eof" && p.OnEnd != nil {
 			p.OnEnd()
 		}
+	}
+}
+
+// failPending releases query waiters when the connection drops.
+func (p *Player) failPending() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id, ch := range p.pending {
+		ch <- ipcReply{err: "connection closed"}
+		delete(p.pending, id)
 	}
 }
 
