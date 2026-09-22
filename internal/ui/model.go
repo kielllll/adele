@@ -74,7 +74,7 @@ func tickCmd(gen int) tea.Cmd {
 // shows the install hint and disables playback keys.
 func New(client *source.Client, p *player.Player, mpvErr string) Model {
 	ti := textinput.New()
-	ti.Placeholder = "Search YouTube… (type to search, enter ↵, esc leaves box)"
+	ti.Placeholder = "Search music.."
 	ti.Focus()
 	ti.CharLimit = 120
 
@@ -101,7 +101,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.input.Width = msg.Width - 4
+		boxW := msg.Width - 4
+		if boxW < 20 {
+			boxW = 20
+		}
+		m.input.Width = boxW - 4
 		m.tracks.SetSize(msg.Width-4, msg.Height-10)
 		return m, nil
 	case searchDoneMsg:
@@ -365,9 +369,21 @@ func (m Model) View() string {
 		return m.homeView()
 	}
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("adele — YouTube TUI"))
-	b.WriteString("\n")
-	b.WriteString(m.input.View())
+	w := m.width
+	if w <= 0 {
+		w = 80
+	}
+	boxW := w - 4
+	if boxW < 20 {
+		boxW = 20
+	}
+	inp := m.input
+	inp.Width = boxW - 4
+	box := searchBox
+	if m.input.Focused() {
+		box = searchFocus
+	}
+	b.WriteString(box.Width(boxW).Render(inp.View()))
 	b.WriteString("\n")
 	b.WriteString(m.tracks.View())
 	b.WriteString("\n")
@@ -489,8 +505,8 @@ const homeBanner = ` █████╗ ██████╗ ██████
 ██║  ██║██████╔╝███████╗███████╗███████╗
 ╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝╚══════╝`
 
-// homeView renders the idle screen: Adele banner on top, search box centered
-// in the middle, hints along the bottom.
+// homeView renders the idle screen: Adele banner just above the search box
+// as one centered group, hints along the bottom.
 func (m Model) homeView() string {
 	w, h := m.width, m.height
 	if w <= 0 {
@@ -500,12 +516,9 @@ func (m Model) homeView() string {
 		h = 24
 	}
 	banner := homeBanner
-	bannerH := 8
 	if w < 50 {
 		banner = "Adele"
-		bannerH = 3
 	}
-	top := lipgloss.Place(w, bannerH, lipgloss.Center, lipgloss.Center, homeTitle.Render(banner))
 
 	boxW := 60
 	if w-8 < boxW {
@@ -521,20 +534,20 @@ func (m Model) homeView() string {
 		box = searchFocus
 	}
 	middle := box.Width(boxW).Render(inp.View())
-	sub := homeSub.Render("Search YouTube · type + enter ↵")
-	body := lipgloss.JoinVertical(lipgloss.Center, middle, "", sub)
+	sub := homeSub.Render("YouTube cli player")
+	body := lipgloss.JoinVertical(lipgloss.Center, homeTitle.Render(banner), sub, "", middle)
 	if m.status != "" {
 		body = lipgloss.JoinVertical(lipgloss.Center, body, statusStyle.Render(m.status))
 	}
 	if m.fatal != "" {
 		body = lipgloss.JoinVertical(lipgloss.Center, body, errStyle.Render(m.fatal))
 	}
-	centerH := h - bannerH - 2
+	centerH := h - 2
 	if centerH < 5 {
 		centerH = 5
 	}
 	mid := lipgloss.Place(w, centerH, lipgloss.Center, lipgloss.Center, body)
 	foot := lipgloss.Place(w, 2, lipgloss.Center, lipgloss.Bottom,
 		statusStyle.Render("enter search · esc leave box · q quit"))
-	return top + "\n" + mid + "\n" + foot
+	return mid + "\n" + foot
 }

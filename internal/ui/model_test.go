@@ -8,6 +8,8 @@ import (
 	"adele/internal/source"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 var ansiRe = regexp.MustCompile("\x1b\\[[0-9;]*m")
@@ -340,5 +342,77 @@ func TestPlayerViewCentered(t *testing.T) {
 	first := stripANSI(strings.SplitN(m.playerView(), "\n", 2)[0])
 	if !strings.HasPrefix(first, " ") {
 		t.Fatalf("panel title should be centered:\n%q", first)
+	}
+}
+
+// browserModel builds the search/results view: sized window plus one result.
+func browserModel(t *testing.T) Model {
+	t.Helper()
+	m := testModel()
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	switch u := updated.(type) {
+	case Model:
+		m = u
+	case *Model:
+		m = *u
+	default:
+		t.Fatalf("Update returned %T, want Model", updated)
+	}
+	updated, _ = m.Update(searchDoneMsg{tracks: []source.Track{{Title: "Hello", Artist: "Adele"}}})
+	switch u := updated.(type) {
+	case Model:
+		return u
+	case *Model:
+		return *u
+	default:
+		t.Fatalf("Update returned %T, want Model", updated)
+		return m
+	}
+}
+
+// The browser view has no app header; the search box sits above results.
+func TestBrowserViewNoTitle(t *testing.T) {
+	v := browserModel(t).View()
+	if strings.Contains(v, "YouTube TUI") {
+		t.Fatalf("browser view should not show the app header:\n%s", v)
+	}
+}
+
+// The browser search input renders inside a bordered box.
+func TestBrowserViewSearchBoxed(t *testing.T) {
+	v := stripANSI(browserModel(t).View())
+	for _, glyph := range []string{"╭", "╮", "╰", "╯"} {
+		if !strings.Contains(v, glyph) {
+			t.Fatalf("browser view missing boxed search input glyph %q:\n%s", glyph, v)
+		}
+	}
+}
+
+// The box border reflects focus: focused and blurred must differ,
+// and both keep the border.
+func TestBrowserViewSearchBoxFocus(t *testing.T) {
+	// Force color output: without a TTY lipgloss drops the border
+	// colors and both states render identically.
+	lipgloss.SetColorProfile(termenv.ANSI)
+	defer lipgloss.SetColorProfile(termenv.Ascii)
+	focused := browserModel(t)
+	updated, _ := focused.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	var blurred Model
+	switch u := updated.(type) {
+	case Model:
+		blurred = u
+	case *Model:
+		blurred = *u
+	default:
+		t.Fatalf("Update returned %T, want Model", updated)
+	}
+	fv, bv := focused.View(), blurred.View()
+	if fv == bv {
+		t.Fatal("focused and blurred search boxes should render differently")
+	}
+	for name, v := range map[string]string{"focused": fv, "blurred": bv} {
+		if s := stripANSI(v); !strings.Contains(s, "╭") {
+			t.Fatalf("%s browser view missing search box border:\n%s", name, v)
+		}
 	}
 }
